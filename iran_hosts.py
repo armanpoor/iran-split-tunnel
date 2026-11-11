@@ -4,8 +4,9 @@ Windows' resolver is hijacked by Happ's WFP filters while the tunnel is up, but 
 UDP/53 to 217.218.155.155 still answers. So: query it ourselves, write the answers
 into the hosts file, and the browser never needs a DNS lookup for those names.
 
-    python _hosts.py apply     # add/refresh the block
-    python _hosts.py clear     # remove it
+    python iran_hosts.py apply     # add/refresh the block
+    python iran_hosts.py status    # what is pinned right now
+    python iran_hosts.py clear     # remove it
 """
 import os, random, socket, struct, sys
 
@@ -20,7 +21,7 @@ NAMES = [
     "aparat.com", "www.aparat.com", "divar.ir", "www.divar.ir",
     "torob.com", "www.torob.com", "sheypoor.com", "www.sheypoor.com",
     "cafebazaar.ir", "shaparak.ir", "www.shaparak.ir", "bmi.ir", "www.bmi.ir",
-    "snapp.ir", "www.snapp.ir", "digikala.com", "www.digikala.com",
+    "snapp.ir", "www.snapp.ir",
 ]
 
 
