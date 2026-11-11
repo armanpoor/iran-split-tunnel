@@ -2,119 +2,120 @@
 
 **Keep Iranian websites working while your VPN is on.**
 
-If you live in Iran and use a VPN, you know this trade-off: turn the VPN on to reach
-Claude, Gemini, GitHub and ChatGPT — and every Iranian site dies. Banks, `sso.my.gov.ir`,
-Shaparak, Digikala, and Iranian AI endpoints like `api.avalai.ir` either time out or
-return `403 Forbidden` because the request now arrives from a foreign datacenter.
+Turn the VPN on to reach Claude, Gemini, GitHub and ChatGPT, and every Iranian site
+dies — banks, `sso.my.gov.ir`, Shaparak, Digikala, `api.avalai.ir` — because the
+request now arrives from a foreign datacenter.
 
-This repo makes both work at the same time: **foreign traffic through the tunnel,
-Iranian traffic direct** — and it keeps working when you switch Wi-Fi, reboot, or
-change VPN provider.
-
-Tested on Windows 11 with **Happ 4.7.2** (Xray TUN). The core fix is VPN-agnostic.
+This repo keeps both working at once: **foreign traffic through the tunnel, Iranian
+traffic direct.** Tested on Windows 11 with Happ 4.7.2 (Xray TUN).
 
 ---
 
 ## Why this is harder than it looks
 
-You'd think `route add` for Iranian IP ranges solves it. It doesn't, and the reason is
-worth knowing before you try.
+You'd think adding routes for Iranian IP ranges solves it. It doesn't.
 
-Modern VPN clients (Happ included) install a **strict-route firewall** — on Happ, 21
-WFP filters. That firewall outranks the Windows route table. You can have 2095/2095
-Iranian routes installed and perfectly correct, and Iranian sites still fail, because
-the packets never consult the table.
+Modern VPN clients install a **strict-route firewall** — Happ creates 21 WFP filters.
+That firewall outranks the Windows route table, so you can have every Iranian route
+installed and correct and Iranian sites still fail.
 
-Then there's DNS, which is a second, independent trap:
+DNS is a second, independent trap:
 
 - Cloudflare (`1.1.1.1`) and Google (`8.8.8.8`) return **NXDOMAIN** for `varzesh3.com`.
-  So a VPN that resolves names through foreign DoH breaks Iranian domains even when
-  routing is right.
-- While Happ's tunnel is up, Windows' own resolver returns **nothing** for Iranian
-  names — but a **raw UDP/53 query** to `217.218.155.155` still answers correctly.
-  The WFP filters catch the resolver, not raw sockets.
+  Measured. An Iranian resolver (`217.218.155.155`) returns real A records.
+- While Happ's tunnel is up, Windows' resolver returns **nothing** for Iranian names,
+  `ping` says "could not find host", and the browser times out — even though the
+  traffic itself is already being routed direct.
 
-That last observation is the whole trick behind this repo.
+So the failure is almost never routing. It is name resolution.
 
 ---
 
-## What actually works
+## What works
 
-`iran_hosts.py` resolves Iranian domains itself over raw UDP/53 — bypassing the
-intercepted resolver — and writes the answers into the hosts file. Windows then never
-needs to look them up.
+Two layers. Both are needed.
 
-Measured with the tunnel genuinely up (`api.ipify.org` showing the VPN IP):
+### 1. Pin the sites you actually use (`iran_hosts.py`)
 
-| Site | Status | Site | Status |
+A hosts entry sidesteps DNS entirely: the name is already an address, so there is
+nothing left to look up. This survives any VPN, any firewall, any DNS hijack.
+
+```powershell
+Set-ItemProperty 'C:\Windows\System32\drivers\etc\hosts' -Name IsReadOnly -Value $false
+python iran_hosts.py apply
+```
+
+Measured with the tunnel genuinely up (`api.ipify.org` = VPN IP), three consecutive
+rounds, 14 sites including `varzesh3`, `avalai`, `sso.my.gov.ir`, `digikala`, `irna`,
+`cafebazaar`, `aparat`, `divar`, `shaparak`, `google`, `github`:
+
+```
+round 1 : 14/14
+round 2 : 14/14
+round 3 : 14/14
+```
+
+**Keep the list small.** Windows scans the hosts file linearly — measured on Windows
+11: 5,000 entries made every lookup take **5.6 s**, 20,000 timed out entirely. A few
+hundred is fine; the whole `.ir` zone is not. `iran_hosts.py` refuses above 2,000.
+
+### 2. Fix Happ's DNS (`happ_dns.py`)
+
+For sites not pinned, Happ must resolve Iranian names itself. The stock profile can't:
+its domestic resolver (`195.168.1.1`) is dead, and its remote DoH (Cloudflare) answers
+NXDOMAIN for Iranian domains.
+
+```powershell
+python happ_dns.py apply      # Happ must be closed
+```
+
+It sets domestic DNS to `217.218.155.155` (answers `.ir` *and* foreign) while leaving
+the remote path on Cloudflare. Measured across a 41-site survey:
+
+| domestic | remote | fakeDns | Iranian sites OK |
 |---|---|---|---|
-| `varzesh3.com` | 301 | `api.avalai.ir` | 200 |
-| `sso.my.gov.ir` | 302 | `digikala.com` | 200 |
-| `divar.ir` | 200 | `aparat.com` | 200 |
-| `google.com` | 200 | `github.com` | 200 |
+| `195.168.1.1` (stock, dead) | 1.1.1.1/DoH | true | 5/41 |
+| `217.218.155.155` | 1.1.1.1/DoH | false | **30/41** |
+| `217.218.155.155` | `217.218.155.155` | false | 6/41 |
 
-Routing confirmed by `Find-NetRoute`:
-
-```
-185.143.233.133  -> Wi-Fi       (Iranian, direct)
-78.38.239.18     -> Wi-Fi       (Iranian, direct)
-142.250.185.78   -> happ-xray   (foreign, through the tunnel)
-```
+The third row is a trap: if the resolver itself is Iranian, Happ routes the resolver
+*into the tunnel* and everything collapses.
 
 ---
 
-## What does *not* work (all tested)
+## What does *not* work (each measured)
 
 | Approach | Why it fails |
 |---|---|
-| **Kernel routes** (`route add` / `netsh`) | Happ's strict-route firewall outranks the Windows route table. |
-| **NRPT rules** | Intercepted before they apply. 19 rules active, still no DNS answer. |
-| **DNS on the TUN adapter** | Happ rewrites it at connect time. |
-| **Happ `excludedRoutes`** | Only implemented for the **sing-box** TUN. On **Xray TUN** it is silently ignored. Worse: the JSON-array and comma-space formats make Happ **fail to connect entirely**. |
-| **Foreign DoH only** | NXDOMAIN for `varzesh3.com`. |
+| Kernel routes (`route add` / `netsh`) | Happ's strict-route firewall outranks the Windows route table. 2095/2095 routes correct, sites still failed. |
+| NRPT rules | Intercepted before they apply. 19 rules active, still no DNS answer. |
+| DNS on the TUN adapter | Happ rewrites it at connect time. |
+| Local DNS proxy on 127.0.0.1:53 | Happ's WFP filters drop the queries. |
+| Happ `excludedRoutes` | Only implemented for the **sing-box** TUN; this machine runs **Xray TUN**. Also: JSON-array and comma-space formats make Happ **fail to connect entirely**. |
+| Pinning the whole `.ir` zone in hosts | 5k entries → 5.6 s per lookup; 20k → unusable. |
 
 ---
 
-## Quick start
+## Honest limits
 
-Requires Python 3.8+ and an Administrator terminal.
-
-```powershell
-# 1. hosts ships read-only on Windows
-Set-ItemProperty 'C:\Windows\System32\drivers\etc\hosts' -Name IsReadOnly -Value $false
-
-# 2. pin Iranian domains to their real IPs
-python iran_hosts.py apply
-
-# 3. check it
-python iran_hosts.py status
-```
-
-That's it. Turn your VPN on and browse.
-
-To undo:
-
-```powershell
-python iran_hosts.py clear
-```
-
-### Adding sites
-
-Edit the `NAMES` list at the top of `iran_hosts.py` and re-run `apply`. Any domain that
-resolves through an Iranian resolver belongs there.
+- **`happ_dns.py` is not fully deterministic.** The same configuration measured 30/41
+  once and 15/47 on another run. That is why the hosts layer exists — it is the
+  reliable one. Treat `happ_dns.py` as an improvement, not a guarantee.
+- **Some Iranian sites are blocked by the ISP**, not the VPN. Measured with the tunnel
+  **off**: `bankmellat`, `refah-bank`, `banksepah`, `saderat-bank`, `snapp`,
+  `tasnimnews`, `farsnews`, `sampad`, `bmi` all return 000 either way. No tooling fixes
+  those; they need a different network path.
+- **IPv4 only.**
+- **`happ_*.py` need Happ closed** — it rewrites `routing.json` on exit.
+- **Windows only.**
 
 ---
 
-## Using this on another machine (any harness)
+## Using this on another machine
 
-`PROMPT.md` is a self-contained prompt. Copy it into Claude Code, Cursor, Codex, or any
-other agent on the new machine and it will diagnose the machine, apply the fix, verify
-it with the tunnel actually up, and register a scheduled task. It carries every trap
-listed above so the agent doesn't rediscover them.
-
-```
-You: <paste PROMPT.md>
-```
+`PROMPT.md` is a self-contained prompt. Paste it into Claude Code, Cursor, Codex or any
+other agent on the target machine. It carries every measurement and trap above so the
+agent does not rediscover them.
 
 ---
 
@@ -122,46 +123,19 @@ You: <paste PROMPT.md>
 
 | File | Purpose |
 |---|---|
-| `iran_hosts.py` | **the fix** — resolves Iranian names over raw UDP/53 and pins them in hosts |
-| `iran_direct.py` | kernel routes + NRPT — useful when the tunnel is **off**, no effect while it's on |
-| `happ_iran.py` | mounts the Iran routing profile on whichever Happ subscription is active |
-| `happ_excluded.py` | writes Happ's `excludedRoutes` (only meaningful on sing-box TUN) |
+| `iran_hosts.py` | **the reliable fix** — pins the sites you list, bypassing DNS |
+| `happ_dns.py` | fixes Happ's domestic resolver (improvement, not a guarantee) |
+| `happ_iran.py` | mounts the Iran routing profile on the active Happ subscription |
+| `iran_direct.py` | kernel routes + NRPT — useful only when the tunnel is **off** |
+| `happ_excluded.py` | writes Happ's `excludedRoutes` (sing-box TUN only) |
 | `iran_cidrs.txt` | 2095 Iranian IPv4 blocks from Chocolate4U `geoip.dat` |
-| `test_iran_direct.py` | 15 assertions, no network required |
+| `test_iran_direct.py` | 15 assertions, no network needed |
 | `PROMPT.md` | the prompt for another machine |
 
----
+## Automatic
 
-## Why the script keeps a stale entry instead of deleting it
-
-Early versions rewrote the hosts block from scratch on every run. When the tunnel was
-up and resolution failed, the block was rewritten **empty** — so access broke a few
-minutes after it had been working, which looked like the fix "randomly stopped".
-
-`apply` now keeps any entry it cannot re-resolve, and refuses to write an empty block.
-Resolution is also parallel with a short deadline, so the scheduled task returns in
-about a second instead of hanging.
-
----
-
-## Keeping it fresh
-
-Iranian CDN addresses rotate. A scheduled task that runs `iran_hosts.py apply` at logon
-and on network change keeps the pins current; `PROMPT.md` sets one up. If a site starts
-failing, re-run `apply`.
-
----
-
-## Limits
-
-- **IPv4 only.** The tunnel is IPv4-only and Iranian v6 ranges are few.
-- **Hosts pinning doesn't follow CDN rotation** between runs — re-run `apply` if a site
-  goes stale.
-- **`happ_iran.py` needs Happ closed**; Happ rewrites `routing.json` on exit.
-- **Other VPNs:** the hosts layer works with any VPN. Routing is then that VPN's job —
-  use its split-tunnel list, or fall back to `iran_direct.py` if it has no strict-route
-  firewall.
-- Windows only. The DNS trick is Windows/WFP specific.
+A scheduled task (`IranDirectRoutes`) runs `iran_hosts.py apply` and
+`iran_direct.py apply` at boot, at logon, and on every network change, as SYSTEM.
 
 ## License
 

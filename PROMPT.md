@@ -1,104 +1,91 @@
 # Prompt: make Iranian sites work while a VPN is on
 
-Paste everything below the line into Claude Code (or any other coding agent) on the
-target Windows machine. The agent will diagnose, fix, verify, and automate it.
+Paste everything below the line into Claude Code (or any coding agent) on the target
+Windows machine.
 
 ---
 
 I'm in Iran using a VPN — Happ, or possibly Windscribe/v2rayN. With the tunnel on,
-Iranian sites (banks, `sso.my.gov.ir`, `api.avalai.ir`, varzesh3, Digikala) fail while
-foreign sites work. I need both at once, permanently, across Wi-Fi changes and reboots.
+Iranian sites fail while foreign sites work. I need both at once, across Wi-Fi changes
+and reboots.
 
-There is a repo checked out here with `iran_hosts.py`, `iran_direct.py`,
-`happ_iran.py`, `happ_excluded.py`, `iran_cidrs.txt`, and a README that explains the
-design. **Read the README first.**
+This repo is checked out here: `iran_hosts.py`, `happ_dns.py`, `happ_iran.py`,
+`iran_direct.py`, `happ_excluded.py`, `iran_cidrs.txt`, and a README that records what
+was measured. **Read the README first** — most of what follows was learned the hard way.
 
-## Do not skip the diagnosis
+## Diagnose before changing anything
 
-Before changing anything, prove the failure on *this* machine. With the tunnel up:
+With the tunnel up, establish which layer is actually broken:
 
 1. `Find-NetRoute -RemoteIPAddress <iranian-ip>` vs `<foreign-ip>` — expect `Wi-Fi` vs
-   the tunnel adapter. If Iranian traffic is *not* already routed direct, the problem is
-   different from the one this repo solves; stop and report.
-2. `curl --resolve www.varzesh3.com:443:<its-ip> https://www.varzesh3.com` — if this
-   returns 200/301 while `curl https://www.varzesh3.com` returns 000, the fault is DNS.
-3. `Resolve-DnsName www.varzesh3.com` — expect no answer.
-4. A raw UDP/53 query to `217.218.155.155` from Python — expect a correct answer.
+   the tunnel adapter. **Routing is usually already correct.** If it isn't, stop: this
+   is a different problem.
+2. `curl --resolve www.varzesh3.com:443:<its-ip> https://www.varzesh3.com` vs
+   `curl https://www.varzesh3.com`. If the first works and the second returns 000, the
+   fault is **DNS**.
+3. `Resolve-DnsName www.varzesh3.com` — expect no answer while the tunnel is up.
 
-If step 4 also fails, this fix will not work on this machine — say so instead of
-applying it blindly.
+4. **Take a tunnel-OFF baseline of every site you test.** This matters: banks
+   (`bankmellat`, `refah-bank`, `banksepah`, `saderat-bank`), `snapp`, `tasnimnews`,
+   `farsnews`, `sampad` and `bmi` were measured returning 000 with the tunnel **off**
+   too — they are blocked by the ISP, and no local change fixes them. Counting them as
+   failures will make a working setup look broken.
 
-## The fix
+## Apply the fix
 
 ```powershell
 Set-ItemProperty 'C:\Windows\System32\drivers\etc\hosts' -Name IsReadOnly -Value $false
-python iran_hosts.py apply
+python iran_hosts.py apply        # the reliable layer
+python happ_dns.py apply          # Happ must be closed
 ```
 
-Add the sites the user actually visits to `NAMES` in `iran_hosts.py` first.
+Add the sites the user actually visits to `NAMES` in `iran_hosts.py`. **Do not try to
+pin the whole `.ir` zone**: 5,000 hosts entries made every lookup take 5.6 s on Windows
+11 and 20,000 made it unusable. The script refuses above 2,000 — keep it in the
+hundreds.
 
-Then, with Happ **closed**, mount the Iran routing profile on the active subscription:
+## Verify honestly
 
-```
-python happ_iran.py apply
-```
+Turning the tunnel on can drop **your own** connection, so run verification **detached**
+and read the log afterwards.
 
-## Verify properly — this is where it goes wrong
+- `api.ipify.org` with the tunnel up must show the **VPN** IP. If it still shows the
+  ISP address, the tunnel is not actually up and every other result is meaningless.
+- Sample **several rounds**, not one. `happ_dns.py` alone measured 30/41 on one run and
+  15/47 on another — it is not deterministic. The hosts layer was stable at 14/14
+  across three consecutive rounds.
+- Report regressions separately from ISP blocks, using the tunnel-off baseline.
 
-Turning the tunnel on can drop **your own** connection (the user's agent may be talking
-to an Iranian endpoint). So:
+## Traps already hit — don't rediscover them
 
-- Run the verification **detached**, writing results to a log file, and read the log
-  afterwards. Never rely on output that has to survive in the live session.
-- A `curl`-only pass is not proof. Check `api.ipify.org` **with the tunnel up**: if it
-  still shows the normal ISP address, the tunnel is not actually up and every other
-  result is meaningless.
-- Only report success when all of these hold **simultaneously**:
-
-```
-api.ipify.org     -> VPN IP (not the ISP IP)
-varzesh3.com      -> 301/200
-api.avalai.ir     -> 200
-sso.my.gov.ir     -> 302
-digikala.com      -> 200
-google.com        -> 200
-github.com        -> 200
-```
-
-Then leave it running for a few minutes and sample repeatedly — the earlier version of
-this fix passed once and broke minutes later, because the scheduled task rewrote the
-hosts block empty when resolution failed. Confirm `iran_hosts.py apply` run **while the
-tunnel is up** reports `kept from previous block` and does not empty the block.
-
-## Make it stick
-
-Register a scheduled task that runs `iran_hosts.py apply` at logon and on network change
-(`Microsoft-Windows-NetworkProfile` event 10000), as SYSTEM, and confirm
-`LastTaskResult` is 0.
-
-## Traps already found — don't rediscover them
-
-- `excludedRoutes` is **not implemented for Xray TUN** (only sing-box). The JSON-array
-  and comma-space formats make Happ **fail to connect entirely**; newline format
-  connects but does nothing. `tunProvider=singbox` is ignored — Happ still builds
-  `happ-xray`.
-- Kernel routes and NRPT are both defeated by Happ's strict-route WFP firewall while the
-  tunnel is up. They only help when it is off.
+- `excludedRoutes` is **not implemented for Xray TUN** (sing-box only). JSON-array and
+  comma-space formats make Happ **fail to connect entirely**; newline connects but does
+  nothing. `tunProvider=singbox` is ignored.
+- Setting Happ's `remoteDnsIp` to an Iranian address makes Happ route the resolver into
+  the tunnel — Iranian sites then drop to 6/41.
+- Kernel routes and NRPT are defeated by Happ's strict-route WFP firewall while the
+  tunnel is up; they only help when it is off.
+- A local DNS proxy on `127.0.0.1:53` is dropped by Happ's filters.
 - `1.1.1.1` and `8.8.8.8` return **NXDOMAIN** for `varzesh3.com`.
 - `C:\Windows\System32\drivers\etc\hosts` ships **read-only**.
 - `happ://connect`, `happ://disconnect`, `happ://toggle` are real deeplinks.
-- `195.168.1.1` (the stock Chocolate4U domestic DNS) is dead. Use `217.218.155.155`.
+- `195.168.1.1` (stock Chocolate4U domestic DNS) is dead. Use `217.218.155.155`.
 - A routing profile mounted on `subscriptionId 0` ("Server List") is invisible to a real
   subscription; Happ then logs `Connection latch: routing disabled for sub N`.
 
-## Report honestly
+## Automate
 
-State which layer you verified and how. If something did not work, say so with the
-observation. Do not claim success from `route print` alone, and do not claim a browser
-test you did not run.
+Register a scheduled task running `iran_hosts.py apply` at logon and on network change
+(`Microsoft-Windows-NetworkProfile` event 10000), as SYSTEM, and confirm
+`LastTaskResult` is 0.
 
 ## If the user switches VPN
 
 The hosts layer is VPN-agnostic and keeps working. Routing then belongs to that VPN: use
-its split-tunnel list, or `iran_direct.py` if it has no strict-route firewall. Re-verify
-with the same detached probe.
+its split-tunnel list, or `iran_direct.py` if it has no strict-route firewall.
+
+## Report
+
+State which layer you verified and how many rounds. Say plainly if something did not
+work. Do not claim success from `route print` alone, and do not claim a browser test you
+did not run.
