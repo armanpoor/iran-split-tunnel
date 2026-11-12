@@ -55,6 +55,8 @@ NAMES = [
     "filimo.com", "www.filimo.com",
     "shaparak.ir", "www.shaparak.ir",
     "snapp.ir", "www.snapp.ir",
+    # rubika (messenger) - measured failing with the tunnel up
+    "rubika.ir", "www.rubika.ir", "web.rubika.ir",
 ]
 
 
